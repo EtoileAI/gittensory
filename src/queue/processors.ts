@@ -1614,7 +1614,7 @@ async function processGitHubWebhook(env: Env, deliveryId: string, eventName: str
     }
 
     if (eventName === "installation" && payload.action === "created") {
-      const installedRepos = payload.repositories?.map((repo) => repo.full_name).filter(Boolean) ?? (payload.repository?.full_name ? [payload.repository.full_name] : [undefined]);
+      const installedRepos = payload.repositories?.map((repo) => repo.full_name).filter(Boolean) ?? (payload.repository?.full_name ? [payload.repository.full_name] : []);
       await Promise.all(
         installedRepos.slice(0, 50).map((repoFullName) =>
           recordGithubProductUsage(env, "github_installation_created", {
@@ -1622,7 +1622,7 @@ async function processGitHubWebhook(env: Env, deliveryId: string, eventName: str
             repoFullName,
             targetKey: payload.installation?.id ? `installation:${payload.installation.id}` : repoFullName,
             outcome: "completed",
-            metadata: { action: payload.action, repoCount: installedRepos.filter(Boolean).length, truncatedRepos: Math.max(installedRepos.length - 50, 0) },
+            metadata: { action: payload.action, repoCount: installedRepos.length, truncatedRepos: Math.max(installedRepos.length - 50, 0) },
           }),
         ),
       );
