@@ -160,6 +160,22 @@ export function renderBrief(
     }
   }
 
+  const nativeBuilds = findings.nativeBuild ?? [];
+  if (nativeBuilds.length) {
+    lines.push(
+      "### Native-build / install-cost dependencies (slow CI install, cross-platform breakage risk)",
+    );
+    for (const item of nativeBuilds) {
+      const why =
+        item.reason === "node-gyp"
+          ? "compiles native code on install with no prebuilt binary"
+          : "ships source-only (no wheel) — needs a build toolchain";
+      lines.push(
+        `- \`${promptText(item.package)}@${promptText(item.version)}\` (${item.ecosystem}) ${why}`,
+      );
+    }
+  }
+
   if (!lines.length) return { promptSection: "", systemSuffix: "" };
 
   const header =

@@ -33,6 +33,11 @@ import {
   scanPatchForSecretLog,
   scanSecretLog,
 } from "../dist/analyzers/secret-log.js";
+import {
+  hasNpmNativeBuild,
+  isPypiSdistOnly,
+  scanNativeBuild,
+} from "../dist/analyzers/native-build.js";
 
 const NOW = new Date("2026-06-26").getTime();
 const eolFetch =
@@ -1198,6 +1203,203 @@ test("buildBrief: secret-log analyzer runs (pure, no network)", async () => {
     assert.equal(brief.analyzerStatus.secretLog, "ok");
     assert.equal(brief.findings.secretLog.length, 1);
     assert.match(brief.promptSection, /Secrets \/ PII reaching a log/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+// ── native-build analyzer (#1512) ─────────────────────────────────────────────
+
+const npmPatch = (name, version) => ({
+  repoFullName: "o/r",
+  prNumber: 1,
+  files: [{ path: "package.json", patch: `+    "${name}": "${version}",` }],
+});
+const pypiPatch = (name, version) => ({
+  repoFullName: "o/r",
+  prNumber: 1,
+  files: [{ path: "requirements.txt", patch: `+${name}==${version}` }],
+});
+
+test("hasNpmNativeBuild: gypfile + no binary => true; prebuilt binary or pure JS => false", () => {
+  assert.equal(hasNpmNativeBuild({ gypfile: true }), true);
+  assert.equal(hasNpmNativeBuild({ gypfile: true, binary: { host: "x" } }), false);
+  assert.equal(hasNpmNativeBuild({ binary: { host: "x" } }), false); // prebuilt, not native
+  assert.equal(hasNpmNativeBuild({ scripts: { install: "x" } }), false); // pure JS
+  assert.equal(hasNpmNativeBuild(undefined), false);
+  assert.equal(hasNpmNativeBuild({}), false);
+  assert.equal(hasNpmNativeBuild({ gypfile: false }), false);
+});
+
+test("isPypiSdistOnly: sdist-only => true; has wheel or empty => false", () => {
+  assert.equal(isPypiSdistOnly({ urls: [{ packagetype: "sdist" }] }), true);
+  assert.equal(
+    isPypiSdistOnly({ urls: [{ packagetype: "sdist" }, { packagetype: "bdist_wheel" }] }),
+    false,
+  );
+  assert.equal(
+    isPypiSdistOnly({ urls: [{ packagetype: "bdist_wheel" }] }),
+    false,
+  );
+  assert.equal(isPypiSdistOnly({ urls: [] }), false); // no signal
+  assert.equal(isPypiSdistOnly(undefined), false);
+});
+
+test("scanNativeBuild: flags npm node-gyp (no binary); skips prebuilt + pure JS", async () => {
+  const fetchImpl = async (url) => {
+    const u = String(url);
+    if (u.includes("/native-no-prebuild")) {
+      return {
+        ok: true,
+        json: async () => ({ versions: { "1.0.0": { gypfile: true } } }),
+      };
+    }
+    if (u.includes("/native-with-prebuild")) {
+      return {
+        ok: true,
+        json: async () => ({
+          versions: { "1.0.0": { gypfile: true, binary: { host: "x" } } },
+        }),
+      };
+    }
+    if (u.includes("/pure-js")) {
+      return { ok: true, json: async () => ({ versions: { "1.0.0": {} } }) };
+    }
+    return { ok: false, json: async () => ({}) };
+  };
+  const findings = await scanNativeBuild(
+    {
+      repoFullName: "o/r",
+      prNumber: 1,
+      files: [
+        { path: "package.json", patch: [
+          '+    "native-no-prebuild": "1.0.0",',
+          '+    "native-with-prebuild": "1.0.0",',
+          '+    "pure-js": "1.0.0",',
+        ].join("\n") },
+      ],
+    },
+    fetchImpl,
+  );
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].package, "native-no-prebuild");
+  assert.equal(findings[0].version, "1.0.0");
+  assert.equal(findings[0].ecosystem, "npm");
+  assert.equal(findings[0].reason, "node-gyp");
+});
+
+test("scanNativeBuild: flags PyPI sdist-only; skips packages that ship a wheel", async () => {
+  const fetchImpl = async () => ({
+    ok: true,
+    json: async () => ({ urls: [{ packagetype: "sdist" }] }),
+  });
+  const wheelFetch = async () => ({
+    ok: true,
+    json: async () => ({
+      urls: [{ packagetype: "sdist" }, { packagetype: "bdist_wheel" }],
+    }),
+  });
+  const flagged = await scanNativeBuild(pypiPatch("source-only", "1.0.0"), fetchImpl);
+  assert.equal(flagged.length, 1);
+  assert.equal(flagged[0].ecosystem, "PyPI");
+  assert.equal(flagged[0].reason, "no-wheel");
+  const clean = await scanNativeBuild(pypiPatch("has-wheel", "1.0.0"), wheelFetch);
+  assert.equal(clean.length, 0);
+});
+
+test("scanNativeBuild: a non-ok registry response yields no finding (fail-safe)", async () => {
+  const fetchImpl = async () => ({ ok: false, json: async () => ({}) });
+  const findings = await scanNativeBuild(npmPatch("anything", "1.0.0"), fetchImpl);
+  assert.deepEqual(findings, []);
+});
+
+test("scanNativeBuild: rejects malformed package names + non-semver npm versions", async () => {
+  let calls = 0;
+  const fetchImpl = async () => { calls++; return { ok: true, json: async () => ({ versions: { "1.0.0": { gypfile: true } } }) }; };
+  await scanNativeBuild(
+    {
+      repoFullName: "o/r",
+      prNumber: 1,
+      files: [
+        { path: "package.json", patch: '+    "../bad-name": "1.0.0",' },
+        { path: "package.json", patch: '+    "good-name": "not-a-version",' },
+      ],
+    },
+    fetchImpl,
+  );
+  assert.equal(calls, 0);
+});
+
+test("scanNativeBuild: caps dependency queries and forwards abort signals", async () => {
+  const seenSignals = [];
+  const files = Array.from({ length: 5 }, (_, i) => ({
+    path: "package.json",
+    patch: `+    "pkg-${i}": "1.0.0",`,
+  }));
+  const controller = new AbortController();
+  const findings = await scanNativeBuild(
+    { repoFullName: "o/r", prNumber: 1, files },
+    async (_url, init) => {
+      seenSignals.push(init.signal);
+      return { ok: true, json: async () => ({ versions: {} }) };
+    },
+    { signal: controller.signal },
+  );
+  assert.equal(findings.length, 0);
+  assert.equal(seenSignals.length, 5); // default MAX_DEPS_QUERIED caps well above 5
+  assert.ok(seenSignals.every((s) => s instanceof AbortSignal));
+});
+
+test("renderBrief: renders the native-build block, escaping markdown in names", () => {
+  const r = renderBrief({
+    nativeBuild: [
+      { package: "native`pkg", version: "1.0.0", ecosystem: "npm", reason: "node-gyp" },
+      { package: "source-only", version: "2.1.3", ecosystem: "PyPI", reason: "no-wheel" },
+    ],
+  });
+  assert.match(r.promptSection, /Native-build \/ install-cost/);
+  assert.match(r.promptSection, /compiles native code on install with no prebuilt binary/);
+  assert.match(r.promptSection, /ships source-only \(no wheel\)/);
+  assert.doesNotMatch(r.promptSection, /native`pkg/); // backtick escaped
+});
+
+test("buildBrief: native-build analyzer runs alongside the others, marked ok", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    if (u.includes("registry.npmjs.org/native-pkg")) {
+      return { ok: true, json: async () => ({ versions: { "1.0.0": { gypfile: true } } }) };
+    }
+    return { ok: true, json: async () => ({}) };
+  };
+  try {
+    const brief = await buildBrief({
+      repoFullName: "o/r",
+      prNumber: 1,
+      analyzers: ["nativeBuild"],
+      files: [{ path: "package.json", patch: '+    "native-pkg": "1.0.0",' }],
+    });
+    assert.equal(brief.analyzerStatus.nativeBuild, "ok");
+    assert.equal(brief.findings.nativeBuild.length, 1);
+    assert.match(brief.promptSection, /Native-build \/ install-cost/);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("buildBrief: native-build analyzer marks degraded + partial on a thrown fetch", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => { throw new Error("registry down"); };
+  try {
+    const brief = await buildBrief({
+      repoFullName: "o/r",
+      prNumber: 2,
+      analyzers: ["nativeBuild"],
+      files: [{ path: "package.json", patch: '+    "x": "1.0.0",' }],
+    });
+    assert.equal(brief.partial, true);
+    assert.equal(brief.analyzerStatus.nativeBuild, "degraded");
+    assert.equal(brief.promptSection, "");
   } finally {
     globalThis.fetch = realFetch;
   }

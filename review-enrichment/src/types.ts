@@ -109,6 +109,18 @@ export interface SecretLogFinding {
   category: "secret" | "pii" | "request-object";
 }
 
+/** A newly added/changed dependency that triggers a native build on install (#1512) — hidden CI cold-start
+ *  cost and a frequent cross-platform breakage source. `package@version` + ecosystem + the reason only —
+ *  never any script body or registry payload (public-safe by construction). */
+export interface NativeBuildFinding {
+  package: string;
+  version: string;
+  ecosystem: "npm" | "PyPI";
+  /** Why this dep carries hidden install cost: `node-gyp` (npm — compiles native code, no prebuilt binary)
+   *  or `no-wheel` (PyPI — ships source-only, needs a build toolchain). */
+  reason: "node-gyp" | "no-wheel";
+}
+
 /** Structured analyzer output. Each analyzer fills its own key; more land as analyzers ship (#1477/#1478). */
 export interface BriefFindings {
   dependency?: DependencyFinding[];
@@ -120,6 +132,7 @@ export interface BriefFindings {
   redos?: RedosFinding[];
   codeowners?: CodeownersFinding[];
   secretLog?: SecretLogFinding[];
+  nativeBuild?: NativeBuildFinding[];
 }
 
 export type AnalyzerStatus = "ok" | "degraded" | "skipped";
