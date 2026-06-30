@@ -1060,6 +1060,84 @@ describe("createSqliteQueue (durable #980)", () => {
     expect(q.size()).toBe(0);
   });
 
+  it("defaults QUEUE_CONCURRENCY to 1 when the env var is unset (#1828)", async () => {
+    const previous = process.env.QUEUE_CONCURRENCY;
+    delete process.env.QUEUE_CONCURRENCY;
+    try {
+      let concurrent = 0;
+      let maxConcurrent = 0;
+      const q = createSqliteQueue(
+        makeDriver(),
+        async () => {
+          concurrent++;
+          maxConcurrent = Math.max(maxConcurrent, concurrent);
+          await new Promise((r) => setTimeout(r, 15));
+          concurrent--;
+        },
+        { pollIntervalMs: 100_000 },
+      );
+      await q.binding.sendBatch([{ body: msg("a") }, { body: msg("b") }]);
+      await new Promise((r) => setTimeout(r, 60));
+      await q.stop();
+      expect(maxConcurrent).toBe(1);
+    } finally {
+      if (previous === undefined) delete process.env.QUEUE_CONCURRENCY;
+      else process.env.QUEUE_CONCURRENCY = previous;
+    }
+  });
+
+  it("uses the QUEUE_CONCURRENCY env override when options.concurrency is absent", async () => {
+    const previous = process.env.QUEUE_CONCURRENCY;
+    process.env.QUEUE_CONCURRENCY = "2";
+    try {
+      let concurrent = 0;
+      let maxConcurrent = 0;
+      const q = createSqliteQueue(
+        makeDriver(),
+        async () => {
+          concurrent++;
+          maxConcurrent = Math.max(maxConcurrent, concurrent);
+          await new Promise((r) => setTimeout(r, 15));
+          concurrent--;
+        },
+        { pollIntervalMs: 100_000 },
+      );
+      await q.binding.sendBatch([{ body: msg("a") }, { body: msg("b") }]);
+      await new Promise((r) => setTimeout(r, 60));
+      await q.stop();
+      expect(maxConcurrent).toBe(2);
+    } finally {
+      if (previous === undefined) delete process.env.QUEUE_CONCURRENCY;
+      else process.env.QUEUE_CONCURRENCY = previous;
+    }
+  });
+
+  it("fails closed to QUEUE_CONCURRENCY=1 when the env var is invalid", async () => {
+    const previous = process.env.QUEUE_CONCURRENCY;
+    process.env.QUEUE_CONCURRENCY = "not-a-number";
+    try {
+      let concurrent = 0;
+      let maxConcurrent = 0;
+      const q = createSqliteQueue(
+        makeDriver(),
+        async () => {
+          concurrent++;
+          maxConcurrent = Math.max(maxConcurrent, concurrent);
+          await new Promise((r) => setTimeout(r, 15));
+          concurrent--;
+        },
+        { pollIntervalMs: 100_000 },
+      );
+      await q.binding.sendBatch([{ body: msg("a") }, { body: msg("b") }]);
+      await new Promise((r) => setTimeout(r, 60));
+      await q.stop();
+      expect(maxConcurrent).toBe(1);
+    } finally {
+      if (previous === undefined) delete process.env.QUEUE_CONCURRENCY;
+      else process.env.QUEUE_CONCURRENCY = previous;
+    }
+  });
+
   it("start() is idempotent and stop() waits for an in-flight pump", async () => {
     let done = false;
     const q = createSqliteQueue(makeDriver(), async () => {

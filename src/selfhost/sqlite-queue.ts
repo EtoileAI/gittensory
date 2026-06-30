@@ -18,6 +18,7 @@ import {
   jobCoalesceKey,
   jobPriority,
   queueBackgroundConcurrency,
+  queueConcurrency,
   queueProcessingTimeoutMs,
   queueRecoveryJitterMs,
   queueStartupJitterMinJobs,
@@ -74,9 +75,9 @@ export interface SqliteQueueOptions {
   maxRetries?: number;
   pollIntervalMs?: number;
   backoffMs?: (attempt: number) => number;
-  /** Max concurrent `processOne()` loops. Defaults to QUEUE_CONCURRENCY env var or 4 — review jobs are I/O-bound
-   *  (GitHub + AI awaits dominate), so overlapping a handful drains a PR burst far faster while SQLite's WAL +
-   *  busy_timeout absorb the short serialized write windows. Set QUEUE_CONCURRENCY=1 to force strict serial. */
+  /** Max concurrent `processOne()` loops. Defaults to QUEUE_CONCURRENCY env var or 1 — the beginner-friendly
+   *  minimal self-host profile should stay serial until an operator has profiled their own box (#1828). Invalid
+   *  env values fail closed to 1; raise QUEUE_CONCURRENCY explicitly when the host has headroom. */
   concurrency?: number;
   /** Max background jobs (priority < 8) allowed to consume concurrent slots. Defaults to QUEUE_BACKGROUND_CONCURRENCY or 1. */
   backgroundConcurrency?: number;
@@ -92,9 +93,7 @@ export function createSqliteQueue(
   const backoff =
     opts.backoffMs ??
     ((attempt: number) => Math.min(60_000, 1000 * 2 ** attempt));
-  const concurrency =
-    opts.concurrency ??
-    Math.max(1, Number(process.env.QUEUE_CONCURRENCY ?? "4"));
+  const concurrency = opts.concurrency ?? queueConcurrency();
   const backgroundConcurrency = queueBackgroundConcurrency(
     concurrency,
     opts.backgroundConcurrency,

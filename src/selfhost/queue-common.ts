@@ -9,6 +9,7 @@ const DEFAULT_STARTUP_JITTER_MS = 3 * 60_000;
 const DEFAULT_RECOVERY_JITTER_MS = 60_000;
 const DEFAULT_STARTUP_JITTER_MIN_JOBS = 8;
 const DEFAULT_PROCESSING_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_QUEUE_CONCURRENCY = 1;
 const DEFAULT_BACKGROUND_CONCURRENCY = 1;
 export const FOREGROUND_QUEUE_PRIORITY_FLOOR = 8;
 
@@ -59,6 +60,18 @@ function agentRegatePriority(payload: string): number {
 
 export function isForegroundJobPriority(priority: number): boolean {
   return priority >= FOREGROUND_QUEUE_PRIORITY_FLOOR;
+}
+
+export function queueConcurrency(
+  configured: unknown = process.env.QUEUE_CONCURRENCY,
+): number {
+  const raw =
+    configured === undefined || configured === null || configured === ""
+      ? DEFAULT_QUEUE_CONCURRENCY
+      : Number(configured);
+  return Number.isFinite(raw) && raw >= 1
+    ? Math.floor(raw)
+    : DEFAULT_QUEUE_CONCURRENCY;
 }
 
 export function queueBackgroundConcurrency(

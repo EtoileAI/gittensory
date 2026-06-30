@@ -17,6 +17,7 @@ import {
   jobCoalesceKey,
   jobPriority,
   queueBackgroundConcurrency,
+  queueConcurrency,
   queueProcessingTimeoutMs,
   queueRecoveryJitterMs,
   queueStartupJitterMinJobs,
@@ -72,9 +73,9 @@ export interface PgQueueOptions {
   maxRetries?: number;
   pollIntervalMs?: number;
   backoffMs?: (attempt: number) => number;
-  /** Max concurrent `processOne()` loops. Defaults to QUEUE_CONCURRENCY env var or 4 — review jobs are I/O-bound
-   *  (GitHub + AI awaits dominate), so overlapping a handful drains a PR burst far faster; FOR UPDATE SKIP LOCKED
-   *  keeps claims race-free across the pool (and across replicas). Set QUEUE_CONCURRENCY=1 to force strict serial. */
+  /** Max concurrent `processOne()` loops. Defaults to QUEUE_CONCURRENCY env var or 1 — keep the out-of-the-box
+   *  self-host profile conservative on small hosts (#1828). Invalid env values fail closed to 1; operators who
+   *  have profiled their stack can raise QUEUE_CONCURRENCY explicitly. FOR UPDATE SKIP LOCKED keeps claims safe. */
   concurrency?: number;
   /** Max background jobs (priority < 8) allowed to consume concurrent slots. Defaults to QUEUE_BACKGROUND_CONCURRENCY or 1. */
   backgroundConcurrency?: number;
@@ -90,9 +91,7 @@ export function createPgQueue(
   const backoff =
     opts.backoffMs ??
     ((attempt: number) => Math.min(60_000, 1000 * 2 ** attempt));
-  const concurrency =
-    opts.concurrency ??
-    Math.max(1, Number(process.env.QUEUE_CONCURRENCY ?? "4"));
+  const concurrency = opts.concurrency ?? queueConcurrency();
   const backgroundConcurrency = queueBackgroundConcurrency(
     concurrency,
     opts.backgroundConcurrency,
