@@ -1076,7 +1076,10 @@ describe("createSqliteQueue (durable #980)", () => {
         },
         { pollIntervalMs: 100_000 },
       );
-      await q.binding.sendBatch([{ body: msg("a") }, { body: msg("b") }]);
+      await q.binding.sendBatch([
+        { body: msg("github-webhook") },
+        { body: msg("github-webhook") },
+      ]);
       await new Promise((r) => setTimeout(r, 60));
       await q.stop();
       expect(maxConcurrent).toBe(1);
@@ -1102,7 +1105,10 @@ describe("createSqliteQueue (durable #980)", () => {
         },
         { pollIntervalMs: 100_000 },
       );
-      await q.binding.sendBatch([{ body: msg("a") }, { body: msg("b") }]);
+      await q.binding.sendBatch([
+        { body: msg("github-webhook") },
+        { body: msg("github-webhook") },
+      ]);
       await new Promise((r) => setTimeout(r, 60));
       await q.stop();
       expect(maxConcurrent).toBe(2);
@@ -1128,7 +1134,10 @@ describe("createSqliteQueue (durable #980)", () => {
         },
         { pollIntervalMs: 100_000 },
       );
-      await q.binding.sendBatch([{ body: msg("a") }, { body: msg("b") }]);
+      await q.binding.sendBatch([
+        { body: msg("github-webhook") },
+        { body: msg("github-webhook") },
+      ]);
       await new Promise((r) => setTimeout(r, 60));
       await q.stop();
       expect(maxConcurrent).toBe(1);
