@@ -442,6 +442,64 @@ test("scanDuplication: respects MAX_FETCHES (caps candidate blob fetches at 30)"
   assert.equal(counter.blob, 30);
 });
 
+test("scanDuplication: bounds matching work for highly repetitive added and candidate blocks", async () => {
+  // Regression for an availability bug: the same MIN_RUN window can appear thousands of times in both the added
+  // block and candidate. The scan should keep enough starts to report the duplicate, but must not compare every
+  // added window against every candidate start and extend each pair synchronously.
+  const repeated = Array.from(
+    { length: 1600 },
+    () => "const repeatedSignificantLine = computeRepeatedValueForDuplicationScan(inputValue)",
+  );
+  const fetchImpl = makeFetch({
+    tree: [{ path: "src/existing-repeated.ts", sha: "d".repeat(40) }],
+    blobs: { ["d".repeat(40)]: repeated.join("\n") },
+  });
+  const req = baseReq({
+    files: [{ path: "src/new-repeated.ts", status: "added", patch: addedPatch(repeated) }],
+  });
+
+  const started = performance.now();
+  const findings = await scanDuplication(req, fetchImpl);
+  const elapsedMs = performance.now() - started;
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].sourceFile, "src/existing-repeated.ts");
+  assert.equal(findings[0].lines, repeated.length);
+  assert.ok(elapsedMs < 1000, `repetitive scan took ${elapsedMs}ms`);
+});
+
+test("scanDuplication: finds the longest run after repeated earlier window decoys", async () => {
+  // Regression for PR #1946: every real MIN_RUN window can have more than eight earlier decoy starts. The scanner
+  // must still compare the true later start and report the full run, not the shorter first decoy.
+  const duplicate = Array.from(
+    { length: 12 },
+    (_, i) => `const duplicateScanLine${i} = computeSharedDuplicateValue(inputValue, ${i})`,
+  );
+  const decoys = [];
+  for (let repeat = 0; repeat < 9; repeat += 1) {
+    for (let start = 0; start + 8 <= duplicate.length; start += 1) {
+      decoys.push(...duplicate.slice(start, start + 8));
+      decoys.push(
+        `const decoyBreakLine${repeat}_${start} = computeDifferentDuplicateValue(inputValue, ${repeat}, ${start})`,
+      );
+    }
+  }
+  const fetchImpl = makeFetch({
+    tree: [{ path: "src/existing-with-decoys.ts", sha: "e".repeat(40) }],
+    blobs: { ["e".repeat(40)]: [...decoys, ...duplicate].join("\n") },
+  });
+  const req = baseReq({
+    files: [{ path: "src/new-with-decoys.ts", status: "added", patch: addedPatch(duplicate) }],
+  });
+
+  const findings = await scanDuplication(req, fetchImpl);
+
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].sourceFile, "src/existing-with-decoys.ts");
+  assert.equal(findings[0].sourceLine, decoys.length + 1);
+  assert.equal(findings[0].lines, duplicate.length);
+});
+
 test("scanDuplication: respects MAX_CANDIDATES (only the closest 40 candidates are considered)", async () => {
   // 100 candidates but MAX_CANDIDATES=40 caps the set; combined with MAX_FETCHES=30 only 30 blobs fetched, and the
   // proximity sort means the in-directory candidate (sharing src/) is preferred and the match is still found.
@@ -474,6 +532,43 @@ test("scanDuplication: an already-aborted signal yields [] without fetching", as
   const findings = await scanDuplication(baseReq(), fetchImpl, { signal: AbortSignal.abort() });
   assert.deepEqual(findings, []);
   assert.equal(counter.tree, 0); // never even fetched the tree
+});
+
+test("scanDuplication: aborting inside the synchronous matcher discards a partial best run", async () => {
+  // Regression for PR #1946 follow-up: cancellation during longestSharedRun must stop the scan, not publish the
+  // current best prefix as if the full comparison had completed.
+  const longShared = Array.from(
+    { length: 1100 },
+    (_, i) => `const abortSensitiveDuplicateLine${i} = computeAbortSensitiveDuplicateValue(inputValue, ${i})`,
+  );
+  let blobServed = false;
+  let readsAfterBlob = 0;
+  const controller = new AbortController();
+  Object.defineProperty(controller.signal, "aborted", {
+    configurable: true,
+    get() {
+      if (!blobServed) return false;
+      readsAfterBlob += 1;
+      return readsAfterBlob >= 5;
+    },
+  });
+  const req = baseReq({
+    files: [{ path: "src/new-long-copy.ts", status: "added", patch: addedPatch(longShared) }],
+  });
+  const baseFetch = makeFetch({
+    tree: [{ path: "src/existing-long-copy.ts", sha: "d".repeat(40) }],
+    blobs: { ["d".repeat(40)]: sourceWithBlock(longShared, 5) },
+  });
+  const fetchImpl = async (url) => {
+    const response = await baseFetch(url);
+    if (url.includes("/git/blobs/")) blobServed = true;
+    return response;
+  };
+
+  const findings = await scanDuplication(req, fetchImpl, { signal: controller.signal });
+
+  assert.deepEqual(findings, []);
+  assert.equal(readsAfterBlob, 5);
 });
 
 test("scanDuplication: no changed source files → [] without fetching", async () => {

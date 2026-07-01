@@ -27,6 +27,7 @@ const MIN_SIGNIFICANT_LEN = 12; // lines shorter than this (after trim) are trea
 const MAX_FILE_BYTES = 500_000; // skip an oversized candidate blob so one huge (likely generated) file can't eat the budget
 const MAX_TREE_JSON_BYTES = 4 * 1024 * 1024; // recursive git tree can be large; bound it like asset-weight does
 const MAX_BLOB_JSON_BYTES = 1024 * 1024; // a base64 blob payload is ~4/3 of the file; bound the JSON we read
+const ABORT_POLL_INTERVAL = 1024; // cheap bitmask-friendly polling inside synchronous matching loops
 
 // Source-code extensions whose copy-paste is meaningful. Text data / config / lockfiles are intentionally excluded.
 const SOURCE_EXTS = new Set([
@@ -236,55 +237,121 @@ function normalizeFileBlocks(text: string): NormBlock[] {
   return blocks;
 }
 
-interface GramIndex {
+interface SuffixState {
+  len: number;
+  link: number;
+  firstPos: number;
+  next: Map<string, number>;
+}
+
+interface MatchIndex {
   block: NormBlock;
-  /** Map of joined MIN_RUN-window key → list of window start indices in `block.norm`. */
-  windows: Map<string, number[]>;
+  states: SuffixState[];
 }
 
-/** Build a rolling MIN_RUN-line window index over a candidate file's significant lines, for fast run lookup. */
-function buildGramIndex(block: NormBlock): GramIndex {
-  const windows = new Map<string, number[]>();
-  for (let i = 0; i + MIN_RUN <= block.norm.length; i++) {
-    const key = block.norm.slice(i, i + MIN_RUN).join("\n");
-    const list = windows.get(key);
-    if (list) list.push(i);
-    else windows.set(key, [i]);
+type SharedRunResult =
+  | { status: "matched"; headLine: number; sourceLine: number; length: number }
+  | { status: "aborted" }
+  | null;
+
+/** Build a suffix automaton over candidate significant lines, so longest-run lookup is exact and linear instead of
+ *  order-dependent on a capped list of repeated MIN_RUN-window starts. */
+function buildMatchIndex(block: NormBlock, signal?: AbortSignal): MatchIndex | null {
+  const states: SuffixState[] = [
+    { len: 0, link: -1, firstPos: -1, next: new Map() },
+  ];
+  let last = 0;
+
+  for (let i = 0; i < block.norm.length; i += 1) {
+    if ((i & (ABORT_POLL_INTERVAL - 1)) === 0 && signal?.aborted) return null;
+
+    const token = block.norm[i]!;
+    const cur = states.length;
+    states.push({
+      len: states[last]!.len + 1,
+      link: 0,
+      firstPos: i,
+      next: new Map(),
+    });
+
+    let p = last;
+    while (p !== -1 && !states[p]!.next.has(token)) {
+      states[p]!.next.set(token, cur);
+      p = states[p]!.link;
+    }
+
+    if (p === -1) {
+      states[cur]!.link = 0;
+    } else {
+      const q = states[p]!.next.get(token)!;
+      if (states[p]!.len + 1 === states[q]!.len) {
+        states[cur]!.link = q;
+      } else {
+        const clone = states.length;
+        states.push({
+          len: states[p]!.len + 1,
+          link: states[q]!.link,
+          firstPos: states[q]!.firstPos,
+          next: new Map(states[q]!.next),
+        });
+        while (p !== -1 && states[p]!.next.get(token) === q) {
+          states[p]!.next.set(token, clone);
+          p = states[p]!.link;
+        }
+        states[q]!.link = clone;
+        states[cur]!.link = clone;
+      }
+    }
+
+    last = cur;
   }
-  return { block, windows };
+
+  return { block, states };
 }
 
-/** Find the LONGEST contiguous run shared between an added block and an indexed candidate, anchored on a matching
- *  MIN_RUN window then extended forward. Returns the head + source line numbers of the run start and its length,
- *  or null when no run of >= MIN_RUN significant lines is shared. */
+/** Find the LONGEST contiguous run shared between an added block and an indexed candidate. Returns the head + source
+ *  line numbers of the run start and its length, or null when no run of >= MIN_RUN significant lines is shared. */
 function longestSharedRun(
   added: NormBlock,
-  index: GramIndex,
-): { headLine: number; sourceLine: number; length: number } | null {
+  index: MatchIndex,
+  signal?: AbortSignal,
+): SharedRunResult {
   const cand = index.block;
-  let best: { headLine: number; sourceLine: number; length: number } | null =
-    null;
-  for (let a = 0; a + MIN_RUN <= added.norm.length; a++) {
-    const key = added.norm.slice(a, a + MIN_RUN).join("\n");
-    const starts = index.windows.get(key);
-    if (!starts) continue;
-    for (const c of starts) {
-      // Verify + extend the run forward from the matched window.
-      let len = MIN_RUN;
-      while (
-        a + len < added.norm.length &&
-        c + len < cand.norm.length &&
-        added.norm[a + len] === cand.norm[c + len]
-      ) {
-        len++;
-      }
-      if (!best || len > best.length) {
-        best = {
-          headLine: added.lineNos[a]!,
-          sourceLine: cand.lineNos[c]!,
-          length: len,
-        };
-      }
+  const states = index.states;
+  let best: Extract<SharedRunResult, { status: "matched" }> | null = null;
+  let state = 0;
+  let length = 0;
+
+  for (let a = 0; a < added.norm.length; a += 1) {
+    if ((a & (ABORT_POLL_INTERVAL - 1)) === 0 && signal?.aborted) {
+      return { status: "aborted" };
+    }
+
+    const token = added.norm[a]!;
+    let next = states[state]!.next.get(token);
+    while (state !== 0 && next === undefined) {
+      state = states[state]!.link;
+      length = states[state]!.len;
+      next = states[state]!.next.get(token);
+    }
+
+    if (next === undefined) {
+      state = 0;
+      length = 0;
+      continue;
+    }
+
+    state = next;
+    length += 1;
+
+    if (length >= MIN_RUN && (!best || length > best.length)) {
+      const sourceEnd = states[state]!.firstPos;
+      best = {
+        status: "matched",
+        headLine: added.lineNos[a - length + 1]!,
+        sourceLine: cand.lineNos[sourceEnd - length + 1]!,
+        length,
+      };
     }
   }
   return best;
@@ -501,18 +568,36 @@ export async function scanDuplication(
       );
       if (text === null) continue; // bad/empty/oversized candidate — skip, never abort (size capped in fetchBlob)
       // Index each gap-delimited block of the candidate separately so a run cannot bridge a blank/trivial line.
-      const indices = normalizeFileBlocks(text)
-        .filter((b) => b.norm.length >= MIN_RUN)
-        .map(buildGramIndex);
+      const indices: MatchIndex[] = [];
+      for (const candidateBlock of normalizeFileBlocks(text).filter(
+        (b) => b.norm.length >= MIN_RUN,
+      )) {
+        const index = buildMatchIndex(candidateBlock, options.signal);
+        if (!index) {
+          aborted = true;
+          break;
+        }
+        indices.push(index);
+      }
+      if (aborted) break;
       if (!indices.length) continue;
 
       for (const file of bk.addedFiles) {
         for (const block of file.blocks) {
           let best: { headLine: number; sourceLine: number; length: number } | null = null;
           for (const index of indices) {
-            const run = longestSharedRun(block, index);
-            if (run && (!best || run.length > best.length)) best = run;
+            if (options.signal?.aborted) {
+              aborted = true;
+              break;
+            }
+            const run = longestSharedRun(block, index, options.signal);
+            if (run?.status === "aborted") {
+              aborted = true;
+              break;
+            }
+            if (run?.status === "matched" && (!best || run.length > best.length)) best = run;
           }
+          if (aborted) break;
           if (!best) continue;
           const key = `${file.path}:${best.headLine}|${cand.path}:${best.sourceLine}`;
           if (seen.has(key)) continue;
@@ -525,6 +610,7 @@ export async function scanDuplication(
             lines: best.length,
           });
         }
+        if (aborted) break;
       }
     }
   }
